@@ -1,0 +1,6 @@
+firebase-admin==6.5.0
+pandas==2.2.2
+numpy==1.26.4
+joblib==1.4.2
+hmmlearn==0.3.2
+xgboost==2.0.3
