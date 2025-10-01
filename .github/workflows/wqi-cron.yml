@@ -1,0 +1,62 @@
+name: WQI Window Service (cron)
+
+on:
+  schedule:
+    - cron: "*/1 * * * *"   # every minute (UTC); change if you want
+  workflow_dispatch:        # add a "Run workflow" button for manual runs
+
+jobs:
+  run-wqi:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Write Firebase service account from secret
+        env:
+          FIREBASE_SA_JSON_B64: ${{ secrets.FIREBASE_SA_JSON_B64 }}
+        run: |
+          echo "$FIREBASE_SA_JSON_B64" | base64 -d > serviceAccountKey.json
+          ls -l serviceAccountKey.json
+
+      - name: Run window-level WQI (one-shot)
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/serviceAccountKey.json
+          FIREBASE_DB_URL: ${{ secrets.FIREBASE_DB_URL }}
+
+          # database paths
+          FB_PATH_SENSOR: sensor_readings
+          FB_PATH_WATERLOGS: waterLogs
+          FB_PATH_RES_WINDOWS: wqi_window_results
+
+          # timestamp field & as-of merge tolerance
+          TIME_FIELD: time
+          ASOF_TOL_SEC: "5"
+
+          # windowing (overlap)
+          WINDOW_SIZE: "10"
+          STEP_SIZE: "3"
+
+          # run once per cron tick (no infinite loop)
+          RUN_CONTINUOUS: "false"
+          # how far back to fetch each run (minutes)
+          LOOKBACK_MIN: "10"
+
+          # model usage (optional; keep false if you don’t have artifacts yet)
+          USE_MODEL: "false"
+          ARTIFACT_DIR: ./artifacts
+          ACCEPTABLE_MODEL_CLASSES: '["low"]'
+        run: |
+          python firebase_window_wqi_service.py
