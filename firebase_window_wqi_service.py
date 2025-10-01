@@ -34,6 +34,8 @@ PATH_RES_WINDOWS = os.getenv("FB_PATH_RES_WINDOWS", "wqi_window_results")
 # Time field key present in both nodes
 TIME_FIELD   = os.getenv("TIME_FIELD", "time")  # epoch ms/sec or ISO string
 ASOF_TOL_SEC = int(os.getenv("ASOF_TOL_SEC", "5"))
+TZ_LOCAL = os.getenv("TZ_LOCAL", "UTC")  # e.g., "Asia/Kolkata"
+
 
 # Windowing (overlap) — default: 10 readings per window, step 3
 WINDOW_SIZE = int(os.getenv("WINDOW_SIZE", "10"))
@@ -73,6 +75,14 @@ ALIASES = {
     "do": "dissolvedO2",
     "chlorophyl": "chlorophyll",
 }
+# Extra aliases for your node names
+FIELD_ALIASES_SENSOR = {
+    "bga_temp_C": "bga_temp",
+    "chl_temp_C": "chl_temp",
+    "chlorophyll_ug_per_L": "chlorophyll",
+    "blue_green_algae_cells_per_mL": "bga",  # treat as bga
+}
+
 
 SENSOR_FIELDS = [
     "pH", "dissolvedO2", "turbidity", "tds", "temp",
@@ -151,45 +161,69 @@ def init_firebase():
     return db
 
 def parse_any_ts(series):
+    """
+    Parse a mix of epoch(sec/ms) or ISO strings.
+    If the string is naive (no timezone), interpret it as TZ_LOCAL, then convert to UTC.
+    Returns pandas Series of timezone-aware UTC timestamps.
+    """
     out = []
     for v in series:
         if pd.isna(v):
             out.append(np.nan); continue
+        # numeric epoch?
         try:
             fv = float(v)
-            if fv > 1e12:       # epoch ms
+            if fv > 1e12:  # epoch ms
                 out.append(datetime.fromtimestamp(fv/1000.0, tz=timezone.utc))
-            elif fv > 1e9:      # epoch sec
+                continue
+            if fv > 1e9:   # epoch sec
                 out.append(datetime.fromtimestamp(fv, tz=timezone.utc))
-            else:
-                raise ValueError()
+                continue
         except Exception:
-            try:
-                out.append(pd.to_datetime(str(v), utc=True).to_pydatetime())
-            except Exception:
-                out.append(np.nan)
+            pass
+
+        # string datetime
+        try:
+            s = str(v).strip()
+            # If ends with Z or +/- offset, pandas will make tz-aware
+            ts = pd.to_datetime(s, utc=False, errors="raise")
+            if ts.tzinfo is None:
+                # naive → assume local TZ (e.g., Asia/Kolkata), then convert to UTC
+                ts = pd.to_datetime(s).tz_localize(TZ_LOCAL).tz_convert("UTC")
+            else:
+                ts = ts.tz_convert("UTC")
+            out.append(ts.to_pydatetime())
+        except Exception:
+            out.append(np.nan)
+
     return pd.Series(out, dtype="datetime64[ns, UTC]")
+
 
 def fetch_node_since(path, since_ts=None):
     ref = db.reference(path)
     data = ref.get() or {}
     if not isinstance(data, dict):
         return pd.DataFrame()
-    rows = []
-    for _, payload in data.items():
-        if isinstance(payload, dict):
-            rows.append(payload)
+
+    rows = [p for p in data.values() if isinstance(p, dict)]
     if not rows:
         return pd.DataFrame()
+
     df = pd.DataFrame(rows)
-    # ensure time
+
+    # 🔁 rename sensor fields if we are reading sensor_readings
+    if path.endswith(PATH_SENSOR):
+        df = df.rename(columns=FIELD_ALIASES_SENSOR)
+
+    # pick up TIME_FIELD or common alternates
     if TIME_FIELD not in df.columns:
-        # try common alternates
-        for cand in ["timestamp", "createdAt", "timeStamp"]:
+        for cand in ["timestamp", "time", "createdAt", "timeStamp"]:
             if cand in df.columns:
                 df[TIME_FIELD] = df[cand]; break
+
     if TIME_FIELD not in df.columns:
         return pd.DataFrame()
+
     df["ts"] = parse_any_ts(df[TIME_FIELD])
     df = df.dropna(subset=["ts"]).sort_values("ts").reset_index(drop=True)
     if since_ts is not None:
