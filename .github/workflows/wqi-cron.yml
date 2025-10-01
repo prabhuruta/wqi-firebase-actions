@@ -41,9 +41,9 @@ jobs:
           FB_PATH_WATERLOGS: waterLogs
           FB_PATH_RES_WINDOWS: wqi_window_results
 
-          # timestamp field & as-of merge tolerance
-          TIME_FIELD: time
-          ASOF_TOL_SEC: "5"
+        # your timestamp key is 'timestamp' and it is in IST local time
+          TIME_FIELD: timestamp
+          TZ_LOCAL: Asia/Kolkata
 
           # windowing (overlap)
           WINDOW_SIZE: "10"
