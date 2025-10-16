@@ -162,42 +162,47 @@ def init_firebase():
 
 def parse_any_ts(series):
     """
-    Parse a mix of epoch(sec/ms) or ISO strings.
-    If the string is naive (no timezone), interpret it as TZ_LOCAL, then convert to UTC.
-    Returns pandas Series of timezone-aware UTC timestamps.
+    Parse timestamps exactly as provided by the sensor, without timezone or UTC conversion.
+    Supports plain strings like '31-08-2025 19:55:19', ISO strings, or numeric epochs.
+    Returns pandas Series of naive datetime64 (interpreted exactly as recorded).
     """
     out = []
     for v in series:
         if pd.isna(v):
-            out.append(np.nan); continue
-        # numeric epoch?
+            out.append(np.nan)
+            continue
+
+        s = str(v).strip()
+
+        # Try numeric epoch (as fallback)
         try:
-            fv = float(v)
+            fv = float(s)
             if fv > 1e12:  # epoch ms
-                out.append(datetime.fromtimestamp(fv/1000.0, tz=timezone.utc))
+                out.append(datetime.fromtimestamp(fv / 1000.0))
                 continue
-            if fv > 1e9:   # epoch sec
-                out.append(datetime.fromtimestamp(fv, tz=timezone.utc))
+            elif fv > 1e9:  # epoch sec
+                out.append(datetime.fromtimestamp(fv))
                 continue
         except Exception:
             pass
 
-        # string datetime
+        # Try direct datetime parsing
         try:
-            s = str(v).strip()
-            # If ends with Z or +/- offset, pandas will make tz-aware
-            ts = pd.to_datetime(s, utc=False, errors="raise")
-            if ts.tzinfo is None:
-                # naive → assume local TZ (e.g., Asia/Kolkata), then convert to UTC
-                ts = pd.to_datetime(s).tz_localize(TZ_LOCAL).tz_convert("UTC")
+            # handle your known format
+            if "-" in s and ":" in s:
+                try:
+                    dt = datetime.strptime(s, "%d-%m-%Y %H:%M:%S")  # Your ESP32 format
+                except ValueError:
+                    dt = pd.to_datetime(s, errors="coerce")
             else:
-                ts = ts.tz_convert("UTC")
-            out.append(ts.to_pydatetime())
+                dt = pd.to_datetime(s, errors="coerce")
+
+            out.append(dt if not pd.isna(dt) else np.nan)
         except Exception:
             out.append(np.nan)
 
-    return pd.Series(out, dtype="datetime64[ns, UTC]")
-
+    # Return without timezone — keep as recorded
+    return pd.Series(out, dtype="datetime64[ns]")
 
 def fetch_node_since(path, since_ts=None):
     ref = db.reference(path)
