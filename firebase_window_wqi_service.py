@@ -32,8 +32,8 @@ PATH_WATERLOGS   = os.getenv("FB_PATH_WATERLOGS",   "waterLogs")
 PATH_RES_WINDOWS = os.getenv("FB_PATH_RES_WINDOWS", "wqi_window_results")
 
 # Time field key present in both nodes
-TIME_FIELD   = os.getenv("TIME_FIELD", "time")  # epoch ms/sec or ISO/IST string
-ASOF_TOL_SEC = int(os.getenv("ASOF_TOL_SEC", "5"))
+TIME_FIELD   = os.getenv("TIME_FIELD", "time")  # epoch ms/sec or ISO/IST/plain string
+ASOF_TOL_SEC = int(os.getenv("ASOF_TOL_SEC", "30"))  # try more tolerant default (30s)
 
 # Windowing (overlap) — default: 10 readings per window, step 3
 WINDOW_SIZE = int(os.getenv("WINDOW_SIZE", "10"))
@@ -48,6 +48,9 @@ LOOKBACK_MIN   = int(os.getenv("LOOKBACK_MIN", "120"))   # initial lookback wind
 ART_DIR   = os.getenv("ARTIFACT_DIR", "./artifacts")
 USE_MODEL = os.getenv("USE_MODEL", "false").lower() == "true"
 ACCEPTABLE_MODEL_CLASSES = set(json.loads(os.getenv("ACCEPTABLE_MODEL_CLASSES", '["low"]')))
+
+# Force a one-time full fetch (ignores since_ts) — helpful to verify data flow
+FORCE_FULL_FETCH_ON_FIRST_RUN = os.getenv("FORCE_FULL_FETCH", "false").lower() == "true"
 
 # ==============================
 # WQI & RULES
@@ -157,6 +160,15 @@ def init_firebase():
         firebase_admin.initialize_app(cred, {"databaseURL": FIREBASE_DB_URL})
     return db
 
+def ping_write():
+    """Write a small ping doc so we know credentials/URL/path are correct."""
+    try:
+        ref = db.reference(PATH_RES_WINDOWS)
+        ref.push({"_ping": True, "ts": pd.Timestamp.now().isoformat()})
+        print(f"[DEBUG] Ping write OK → /{PATH_RES_WINDOWS}")
+    except Exception as e:
+        print("[ERROR] Ping write failed:", e)
+
 def parse_any_ts(series):
     """
     Parse timestamps exactly as provided by the sensor, without timezone or UTC conversion.
@@ -185,7 +197,6 @@ def parse_any_ts(series):
 
         # Try direct datetime parsing
         try:
-            # handle your known format
             if "-" in s and ":" in s:
                 try:
                     dt = datetime.strptime(s, "%d-%m-%Y %H:%M:%S")  # Your ESP32 format
@@ -193,27 +204,27 @@ def parse_any_ts(series):
                     dt = pd.to_datetime(s, errors="coerce")
             else:
                 dt = pd.to_datetime(s, errors="coerce")
-
             out.append(dt if not pd.isna(dt) else np.nan)
         except Exception:
             out.append(np.nan)
 
-    # Return without timezone — keep as recorded
     return pd.Series(out, dtype="datetime64[ns]")
 
 def fetch_node_since(path, since_ts=None):
     ref = db.reference(path)
     data = ref.get() or {}
     if not isinstance(data, dict):
+        print(f"[DEBUG] {path}: no data dict")
         return pd.DataFrame()
 
     rows = [p for p in data.values() if isinstance(p, dict)]
     if not rows:
+        print(f"[DEBUG] {path}: zero rows")
         return pd.DataFrame()
 
     df = pd.DataFrame(rows)
 
-    # 🔁 rename sensor fields if we are reading sensor_readings
+    # rename sensor fields if we are reading sensor_readings
     if path.endswith(PATH_SENSOR):
         df = df.rename(columns=FIELD_ALIASES_SENSOR)
 
@@ -224,22 +235,29 @@ def fetch_node_since(path, since_ts=None):
                 df[TIME_FIELD] = df[cand]; break
 
     if TIME_FIELD not in df.columns:
+        print(f"[DEBUG] {path}: no time field found")
         return pd.DataFrame()
 
     df["ts"] = parse_any_ts(df[TIME_FIELD])
+    before = len(df)
     df = df.dropna(subset=["ts"]).sort_values("ts").reset_index(drop=True)
+    after = len(df)
+    if before != after:
+        print(f"[DEBUG] {path}: dropped {before - after} rows due to bad timestamps")
 
-    # 🔧 Coerce since_ts to naive pandas Timestamp before comparing
+    # Coerce since_ts to naive pandas Timestamp before comparing
     if since_ts is not None:
         try:
             since_ts_pd = pd.Timestamp(since_ts)
         except Exception:
-            # allow dd-mm-YYYY HH:MM:SS strings too
             since_ts_pd = pd.to_datetime(since_ts, format="%d-%m-%Y %H:%M:%S", errors="coerce")
 
         if (since_ts_pd is not pd.NaT) and not pd.isna(since_ts_pd):
             # strip tz if present, keep it naive
-            since_ts_pd = since_ts_pd.tz_localize(None) if getattr(since_ts_pd, "tz", None) is not None else since_ts_pd
+            try:
+                since_ts_pd = since_ts_pd.tz_localize(None)
+            except Exception:
+                pass
             df = df[df["ts"] > since_ts_pd]
 
     return df
@@ -315,7 +333,7 @@ class OptionalModel:
         X_cols = []
         for col in self.feature_order:
             if col in df_win_stats.columns:
-                X_cols.append(df_win_stats[col].astype(float).values)
+                X_cols.append(pd.to_numeric(df_win_stats[col], errors="coerce").astype(float).values)
             else:
                 # alias resolve if needed
                 alias_src = None
@@ -323,7 +341,7 @@ class OptionalModel:
                     if canonical == col and a in df_win_stats.columns:
                         alias_src = a; break
                 if alias_src:
-                    X_cols.append(df_win_stats[alias_src].astype(float).values)
+                    X_cols.append(pd.to_numeric(df_win_stats[alias_src], errors="coerce").astype(float).values)
                 else:
                     X_cols.append(np.zeros(len(df_win_stats)))
         X = np.column_stack(X_cols).astype(float)
@@ -365,16 +383,24 @@ def process_once_windows(since_ts=None, last_pushed_end_ts=None, model: Optional
     Returns:
         max_ts_seen, max_window_end_ts, n_windows_pushed
     """
+    print(f"[DEBUG] since_ts: {since_ts}  last_pushed_end_ts: {last_pushed_end_ts}")
+
     df1 = fetch_node_since(PATH_SENSOR, since_ts=since_ts)
     df2 = fetch_node_since(PATH_WATERLOGS, since_ts=since_ts)
-    if df1.empty and df2.empty:
-        print("No new rows.")
-        return since_ts, last_pushed_end_ts, 0
+
+    print(f"[DEBUG] fetched {PATH_SENSOR}: {len(df1)} rows; {PATH_WATERLOGS}: {len(df2)} rows")
+    if not df1.empty:
+        print(f"[DEBUG] {PATH_SENSOR} ts: {df1['ts'].min()} → {df1['ts'].max()}")
+    if not df2.empty:
+        print(f"[DEBUG] {PATH_WATERLOGS} ts: {df2['ts'].min()} → {df2['ts'].max()}")
 
     merged = merge_two_streams(df1, df2, tol_sec=ASOF_TOL_SEC)
+    print(f"[DEBUG] merged rows: {len(merged)} (ASOF_TOL_SEC={ASOF_TOL_SEC})")
+    if not merged.empty:
+        print(f"[DEBUG] merged ts: {merged['ts'].min()} → {merged['ts'].max()}")
+
     if merged.empty:
-        print("Merged is empty (timestamps too far).")
-        # still advance watermark by the max of individual streams
+        # Still advance watermark by the max of individual streams
         max_ts_seen = None
         if not df1.empty:
             max_ts_seen = df1["ts"].max()
@@ -387,9 +413,11 @@ def process_once_windows(since_ts=None, last_pushed_end_ts=None, model: Optional
     dfm = merged[keep_cols].copy()
     dfm = dfm.sort_values("ts").reset_index(drop=True)
 
+    print(f"[DEBUG] dfm rows eligible for windowing: {len(dfm)}  WINDOW_SIZE={WINDOW_SIZE}, STEP={STEP_SIZE}")
+
     n = len(dfm)
     if n < WINDOW_SIZE:
-        print(f"Not enough rows for one window yet (have {n}, need {WINDOW_SIZE}).")
+        print(f"[DEBUG] Not enough rows for one window yet (have {n}, need {WINDOW_SIZE}).")
         return dfm["ts"].max(), last_pushed_end_ts, 0
 
     # Build windows
@@ -422,8 +450,13 @@ def process_once_windows(since_ts=None, last_pushed_end_ts=None, model: Optional
                 row_out[k] = float(v)
         win_rows.append(row_out)
 
+    print(f"[DEBUG] windows built: {len(win_rows)}")
+    if win_rows:
+        print(f"[DEBUG] first window: {win_rows[0]['window_start_ts']} → {win_rows[0]['window_end_ts']}")
+        print(f"[DEBUG] last  window: {win_rows[-1]['window_start_ts']} → {win_rows[-1]['window_end_ts']}")
+
     if not win_rows:
-        print("No new windows to push.")
+        print("[DEBUG] No new windows to push.")
         return dfm["ts"].max(), last_pushed_end_ts, 0
 
     out_df = pd.DataFrame(win_rows)
@@ -443,10 +476,12 @@ def process_once_windows(since_ts=None, last_pushed_end_ts=None, model: Optional
     out_ref = db.reference(PATH_RES_WINDOWS)
     pushed = 0
     max_end_ts = last_pushed_end_ts
+
+    print(f"[DEBUG] pushing to RTDB path: /{PATH_RES_WINDOWS}")
     for _, r in out_df.iterrows():
         payload = r.to_dict()
 
-        # Convert timestamps to ISO strings for Firebase payload (keep human readable, no tz changes)
+        # Convert timestamps to ISO strings for Firebase payload (human readable, no tz changes)
         for key in ["window_start_ts", "window_end_ts"]:
             val = payload.get(key)
             if isinstance(val, pd.Timestamp):
@@ -460,8 +495,13 @@ def process_once_windows(since_ts=None, last_pushed_end_ts=None, model: Optional
         payload.pop("window_start_ts", None)
         payload.pop("window_end_ts", None)
 
-        out_ref.push(payload)
-        pushed += 1
+        try:
+            out_ref.push(payload)
+            pushed += 1
+        except Exception as e:
+            print("[ERROR] push failed:", e, "payload=", payload)
+            continue
+
         # track watermark by end ts
         cur_end = r.get("window_end_ts")
         if isinstance(cur_end, pd.Timestamp) or isinstance(cur_end, datetime):
@@ -478,18 +518,23 @@ def main():
     # Init Firebase
     if not os.path.exists(SERVICE_ACCOUNT_JSON):
         raise RuntimeError("Service account JSON not found. Set GOOGLE_APPLICATION_CREDENTIALS env var.")
-    firebase_admin_db = init_firebase()
+    init_firebase()
     print("Connected to Firebase:", FIREBASE_DB_URL)
+    print(f"[DEBUG] Paths → sensor: /{PATH_SENSOR}, logs: /{PATH_WATERLOGS}, output: /{PATH_RES_WINDOWS}")
+
+    # Ping write to verify permissions/path
+    ping_write()
 
     # Optional model
     model = OptionalModel(ART_DIR) if USE_MODEL else None
 
-    # 🔧 Initialize since_ts as NAIVE pandas Timestamp (no tz) — avoids dtype mismatch
-    since_ts = pd.Timestamp.now().tz_localize(None) - pd.Timedelta(minutes=LOOKBACK_MIN)
+    # Initialize watermark as NAIVE pandas Timestamp (no tz)
+    since_ts = None if FORCE_FULL_FETCH_ON_FIRST_RUN else (pd.Timestamp.now().tz_localize(None) - pd.Timedelta(minutes=LOOKBACK_MIN))
     last_pushed_end_ts = None
 
     if not RUN_CONTINUOUS:
-        _, _, _ = process_once_windows(since_ts=since_ts, last_pushed_end_ts=last_pushed_end_ts, model=model)
+        print("[DEBUG] Running single pass...")
+        process_once_windows(since_ts=since_ts, last_pushed_end_ts=last_pushed_end_ts, model=model)
         return
 
     print(f"Running continuous mode; polling every {POLL_SECONDS}s; window size={WINDOW_SIZE}, step={STEP_SIZE}")
@@ -499,7 +544,7 @@ def main():
                 since_ts=since_ts, last_pushed_end_ts=last_pushed_end_ts, model=model
             )
             if max_ts_seen is not None:
-                since_ts = max_ts_seen  # move pull watermark forward (already a pandas Timestamp)
+                since_ts = max_ts_seen  # move pull watermark forward
         except Exception as e:
             print("❌ Error in loop:", e)
         time.sleep(POLL_SECONDS)
