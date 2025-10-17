@@ -3,7 +3,7 @@ import time
 import json
 import math
 import warnings
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
@@ -32,10 +32,8 @@ PATH_WATERLOGS   = os.getenv("FB_PATH_WATERLOGS",   "waterLogs")
 PATH_RES_WINDOWS = os.getenv("FB_PATH_RES_WINDOWS", "wqi_window_results")
 
 # Time field key present in both nodes
-TIME_FIELD   = os.getenv("TIME_FIELD", "time")  # epoch ms/sec or ISO string
+TIME_FIELD   = os.getenv("TIME_FIELD", "time")  # epoch ms/sec or ISO/IST string
 ASOF_TOL_SEC = int(os.getenv("ASOF_TOL_SEC", "5"))
-TZ_LOCAL = os.getenv("TZ_LOCAL", "UTC")  # e.g., "Asia/Kolkata"
-
 
 # Windowing (overlap) — default: 10 readings per window, step 3
 WINDOW_SIZE = int(os.getenv("WINDOW_SIZE", "10"))
@@ -82,7 +80,6 @@ FIELD_ALIASES_SENSOR = {
     "chlorophyll_ug_per_L": "chlorophyll",
     "blue_green_algae_cells_per_mL": "bga",  # treat as bga
 }
-
 
 SENSOR_FIELDS = [
     "pH", "dissolvedO2", "turbidity", "tds", "temp",
@@ -231,8 +228,20 @@ def fetch_node_since(path, since_ts=None):
 
     df["ts"] = parse_any_ts(df[TIME_FIELD])
     df = df.dropna(subset=["ts"]).sort_values("ts").reset_index(drop=True)
+
+    # 🔧 Coerce since_ts to naive pandas Timestamp before comparing
     if since_ts is not None:
-        df = df[df["ts"] > since_ts]
+        try:
+            since_ts_pd = pd.Timestamp(since_ts)
+        except Exception:
+            # allow dd-mm-YYYY HH:MM:SS strings too
+            since_ts_pd = pd.to_datetime(since_ts, format="%d-%m-%Y %H:%M:%S", errors="coerce")
+
+        if (since_ts_pd is not pd.NaT) and not pd.isna(since_ts_pd):
+            # strip tz if present, keep it naive
+            since_ts_pd = since_ts_pd.tz_localize(None) if getattr(since_ts_pd, "tz", None) is not None else since_ts_pd
+            df = df[df["ts"] > since_ts_pd]
+
     return df
 
 def merge_two_streams(df1, df2, tol_sec=5):
@@ -271,7 +280,7 @@ def aggregate_window(df_slice):
     for col in SENSOR_FIELDS:
         if col in df_slice.columns:
             stats[col] = float(pd.to_numeric(df_slice[col], errors="coerce").astype(float).mean())
-    # example: include variability
+    # include variability
     for col in ["turbidity", "tds", "dissolvedO2", "pH", "temp"]:
         if col in df_slice.columns:
             stats[f"{col}_std"] = float(pd.to_numeric(df_slice[col], errors="coerce").astype(float).std(ddof=0))
@@ -437,13 +446,13 @@ def process_once_windows(since_ts=None, last_pushed_end_ts=None, model: Optional
     for _, r in out_df.iterrows():
         payload = r.to_dict()
 
-        # Convert timestamps to ISO strings
+        # Convert timestamps to ISO strings for Firebase payload (keep human readable, no tz changes)
         for key in ["window_start_ts", "window_end_ts"]:
             val = payload.get(key)
             if isinstance(val, pd.Timestamp):
                 payload[key.replace("_ts","_iso")] = val.isoformat()
             elif isinstance(val, datetime):
-                payload[key.replace("_ts","_iso")] = val.isoformat()
+                payload[key.replace("_ts","_iso")] = pd.Timestamp(val).isoformat()
             else:
                 payload[key.replace("_ts","_iso")] = str(val)
 
@@ -475,8 +484,8 @@ def main():
     # Optional model
     model = OptionalModel(ART_DIR) if USE_MODEL else None
 
-    # Initialize watermarks
-    since_ts = datetime.now(timezone.utc) - timedelta(minutes=LOOKBACK_MIN)
+    # 🔧 Initialize since_ts as NAIVE pandas Timestamp (no tz) — avoids dtype mismatch
+    since_ts = pd.Timestamp.now().tz_localize(None) - pd.Timedelta(minutes=LOOKBACK_MIN)
     last_pushed_end_ts = None
 
     if not RUN_CONTINUOUS:
@@ -490,7 +499,7 @@ def main():
                 since_ts=since_ts, last_pushed_end_ts=last_pushed_end_ts, model=model
             )
             if max_ts_seen is not None:
-                since_ts = max_ts_seen  # move pull watermark forward
+                since_ts = max_ts_seen  # move pull watermark forward (already a pandas Timestamp)
         except Exception as e:
             print("❌ Error in loop:", e)
         time.sleep(POLL_SECONDS)
