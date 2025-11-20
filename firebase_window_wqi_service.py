@@ -1,3 +1,4 @@
+# full_wqi_hmm_xgb_pipeline_mandatory_ml.py
 import os
 import time
 import json
@@ -33,7 +34,7 @@ PATH_RES_WINDOWS = os.getenv("FB_PATH_RES_WINDOWS", "wqi_window_results")
 
 # Time field key present in both nodes
 TIME_FIELD   = os.getenv("TIME_FIELD", "time")  # epoch ms/sec or ISO/IST/plain string
-ASOF_TOL_SEC = int(os.getenv("ASOF_TOL_SEC", "30"))  # try more tolerant default (30s)
+ASOF_TOL_SEC = int(os.getenv("ASOF_TOL_SEC", "30"))  # tolerance for merge_asof in seconds
 
 # Windowing (overlap) — default: 10 readings per window, step 3
 WINDOW_SIZE = int(os.getenv("WINDOW_SIZE", "10"))
@@ -44,9 +45,9 @@ RUN_CONTINUOUS = os.getenv("RUN_CONTINUOUS", "true").lower() == "true"
 POLL_SECONDS   = int(os.getenv("POLL_SECONDS", "20"))
 LOOKBACK_MIN   = int(os.getenv("LOOKBACK_MIN", "120"))   # initial lookback window for first pull
 
-# Optional ML artifacts
+# ML artifacts directory (must exist)
 ART_DIR   = os.getenv("ARTIFACT_DIR", "./artifacts")
-USE_MODEL = os.getenv("USE_MODEL", "false").lower() == "true"
+# Note: ML is mandatory now; script will error if artifacts missing/invalid
 ACCEPTABLE_MODEL_CLASSES = set(json.loads(os.getenv("ACCEPTABLE_MODEL_CLASSES", '["low"]')))
 
 # Force a one-time full fetch (ignores since_ts) — helpful to verify data flow
@@ -306,9 +307,12 @@ def aggregate_window(df_slice):
     return stats
 
 # ==============================
-# Optional ML prediction (window-level)
+# Mandatory ML prediction (window-level)
 # ==============================
 class OptionalModel:
+    """
+    Loads artifacts. Name kept for compatibility; but ML is mandatory.
+    """
     def __init__(self, art_dir):
         self.ok = False
         try:
@@ -324,11 +328,13 @@ class OptionalModel:
             self.ok = True
             print("✅ Loaded model artifacts.")
         except Exception as e:
+            # Bubble up a clear message but keep ok=False
             print("⚠️ Model artifacts missing/incomplete:", e)
+            self.ok = False
 
     def predict_windows(self, df_win_stats):
         if not self.ok or df_win_stats.empty:
-            return pd.Series([None]*len(df_win_stats)), pd.Series([None]*len(df_win_stats))
+            raise RuntimeError("Model not loaded or input empty")
         # Build feature matrix using training feature order; missing -> 0
         X_cols = []
         for col in self.feature_order:
@@ -347,7 +353,9 @@ class OptionalModel:
         X = np.column_stack(X_cols).astype(float)
         X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
+        # Scale
         Xs = self.scaler.transform(X)
+
         # HMM features
         try:
             logprob, post = self.hmm.score_samples(Xs)
@@ -378,7 +386,7 @@ def process_once_windows(since_ts=None, last_pushed_end_ts=None, model: Optional
     1) Pull new data from both nodes since `since_ts`
     2) Merge as-of on timestamp
     3) Build sliding windows (WINDOW_SIZE, STEP_SIZE)
-    4) Aggregate stats per window; compute WQI & rule decision; (optional) model predict
+    4) Aggregate stats per window; compute WQI & rule decision; (mandatory) model predict
     5) Push per-window results to Firebase at PATH_RES_WINDOWS
     Returns:
         max_ts_seen, max_window_end_ts, n_windows_pushed
@@ -461,16 +469,16 @@ def process_once_windows(since_ts=None, last_pushed_end_ts=None, model: Optional
 
     out_df = pd.DataFrame(win_rows)
 
-    # Optional ML (window-level) on aggregated stats
-    if model and model.ok:
+    # --- Mandatory ML prediction (window-level) ---
+    if model is None or not getattr(model, "ok", False):
+        raise RuntimeError("ML model not loaded; cannot proceed (ML is mandatory).")
+    try:
         y_name, y_conf = model.predict_windows(out_df)
         out_df["model_class"] = y_name
         out_df["model_conf"]  = y_conf
         out_df["final_drinkable"] = out_df["rule_drinkable"] & out_df["model_class"].isin(ACCEPTABLE_MODEL_CLASSES)
-    else:
-        out_df["model_class"]     = None
-        out_df["model_conf"]      = None
-        out_df["final_drinkable"] = out_df["rule_drinkable"]  # rules-only
+    except Exception as e:
+        raise RuntimeError("ML prediction failed: " + str(e))
 
     # Push to Firebase
     out_ref = db.reference(PATH_RES_WINDOWS)
@@ -525,15 +533,21 @@ def main():
     # Ping write to verify permissions/path
     ping_write()
 
-    # Optional model
-    model = OptionalModel(ART_DIR) if USE_MODEL else None
+    # --- Mandatory ML model: ALWAYS load artifacts and fail fast if missing ---
+    print("[INFO] Loading HMM + XGBoost model artifacts from:", ART_DIR)
+    model = OptionalModel(ART_DIR)
+    if not model.ok:
+        raise RuntimeError(
+            "ML artifacts missing or failed to load from ART_DIR. "
+            "Ensure scaler.joblib, hmm_model.joblib, xgb_model.joblib, final_feature_order.json (and label_encoder.joblib optionally) are present."
+        )
 
     # Initialize watermark as NAIVE pandas Timestamp (no tz)
     since_ts = None if FORCE_FULL_FETCH_ON_FIRST_RUN else (pd.Timestamp.now().tz_localize(None) - pd.Timedelta(minutes=LOOKBACK_MIN))
     last_pushed_end_ts = None
 
     if not RUN_CONTINUOUS:
-        print("[DEBUG] Running single pass...")
+        print("[DEBUG] Running single pass with ML...")
         process_once_windows(since_ts=since_ts, last_pushed_end_ts=last_pushed_end_ts, model=model)
         return
 
@@ -547,6 +561,8 @@ def main():
                 since_ts = max_ts_seen  # move pull watermark forward
         except Exception as e:
             print("❌ Error in loop:", e)
+            # sleep a bit on error to avoid tight loop
+            time.sleep(POLL_SECONDS)
         time.sleep(POLL_SECONDS)
 
 if __name__ == "__main__":
