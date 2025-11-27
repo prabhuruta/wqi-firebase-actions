@@ -89,7 +89,7 @@ PY
           # run once per cron tick (no infinite loop)
           RUN_CONTINUOUS: "false"
           # how far back to fetch each run (minutes)
-          LOOKBACK_MIN: "120"
+          LOOKBACK_MIN: "10"
 
           # ML options
           USE_MODEL: "false"                # set to "true" only after placing artifacts in ./artifacts
