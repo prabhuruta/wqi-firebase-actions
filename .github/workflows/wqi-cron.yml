@@ -2,8 +2,8 @@ name: WQI Window Service (cron)
 
 on:
   schedule:
-    - cron: "*/1 * * * *"   # every minute (UTC); change as needed
-  workflow_dispatch:        # manual run button
+    - cron: "*/1 * * * *"   # every minute (UTC) — change as needed
+  workflow_dispatch:        # allow manual runs
 
 jobs:
   run-wqi:
@@ -11,7 +11,7 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -24,33 +24,18 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Create & validate service account JSON from secret
+      - name: Decode service account JSON (from base64 secret)
         env:
           FIREBASE_SA_JSON_B64: ${{ secrets.FIREBASE_SA_JSON_B64 }}
-          FIREBASE_SA_JSON_RAW: ${{ secrets.FIREBASE_SA_JSON_RAW }}
         run: |
           set -euo pipefail
-
-          # Prefer base64 secret if present
-          if [ -n "${FIREBASE_SA_JSON_B64:-}" ]; then
-            echo "[INFO] Using FIREBASE_SA_JSON_B64 (base64)"
-            echo "$FIREBASE_SA_JSON_B64" | base64 --decode > serviceAccountKey.json
-          elif [ -n "${FIREBASE_SA_JSON_RAW:-}" ]; then
-            echo "[INFO] Using FIREBASE_SA_JSON_RAW (raw JSON)"
-            echo "$FIREBASE_SA_JSON_RAW" > serviceAccountKey.json
-          else
-            echo "ERROR: Set either FIREBASE_SA_JSON_B64 or FIREBASE_SA_JSON_RAW secret."
+          if [ -z "${FIREBASE_SA_JSON_B64:-}" ]; then
+            echo "ERROR: secret FIREBASE_SA_JSON_B64 is empty. Add it in repo Settings → Secrets."
             exit 1
           fi
-
-          # Basic file checks
-          echo "serviceAccountKey.json -> size: $(wc -c < serviceAccountKey.json) bytes"
-          echo "----- head (first 200 chars) -----"
-          head -c 200 serviceAccountKey.json | sed -n l || true
-          echo "----- tail (last 200 chars) -----"
-          tail -c 200 serviceAccountKey.json | sed -n l || true
-
-          # Validate JSON by trying to load it in Python
+          echo "$FIREBASE_SA_JSON_B64" | base64 --decode > serviceAccountKey.json
+          echo "serviceAccountKey.json written. size: $(wc -c < serviceAccountKey.json) bytes"
+          # Validate JSON quickly
           python - <<'PY'
 import json,sys
 try:
@@ -61,18 +46,18 @@ except Exception as e:
     sys.exit(2)
 PY
 
-      - name: Create artifacts directory (for ML artifacts)
+      - name: Create artifacts directory
         run: |
           mkdir -p artifacts
           ls -la artifacts || true
 
-      - name: Run window-level WQI (one-shot)
+      - name: Run window-level WQI (single pass)
         env:
           # Firebase & service account
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/serviceAccountKey.json
           FIREBASE_DB_URL: ${{ secrets.FIREBASE_DB_URL }}
 
-          # database paths (adjust if needed)
+          # database paths
           FB_PATH_SENSOR: sensor_readings
           FB_PATH_WATERLOGS: waterLogs
           FB_PATH_RES_WINDOWS: wqi_window_results
@@ -87,10 +72,9 @@ PY
 
           # run once per cron tick (no infinite loop)
           RUN_CONTINUOUS: "false"
-          # how far back to fetch each run (minutes)
           LOOKBACK_MIN: "10"
 
-          # ML options (set to "true" only after placing artifacts in ./artifacts)
+          # model options (put artifacts under ./artifacts if you plan to use model)
           USE_MODEL: "false"
           ARTIFACT_DIR: ./artifacts
           ACCEPTABLE_MODEL_CLASSES: '["low"]'
