@@ -1,43 +1,100 @@
-name: Run WQI Service
+name: WQI Window Service (cron)
 
 on:
-  workflow_dispatch:
+  schedule:
+    - cron: "*/1 * * * *"   # every minute (UTC); change as needed
+  workflow_dispatch:        # manual run button
 
 jobs:
-  run:
+  run-wqi:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.11"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install firebase-admin pandas numpy joblib xgboost hmmlearn scikit-learn
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Create service account JSON from secret
+      # --- Create & validate serviceAccountKey.json (supports base64 or raw secret) ---
+      - name: Create & validate service account JSON from secret
         env:
-          SA_BASE64: ${{ secrets.SA_BASE64 }}
+          SA_B64: ${{ secrets.FIREBASE_SA_JSON_B64 }}
+          SA_RAW: ${{ secrets.FIREBASE_SA_JSON_RAW }}
         run: |
-          echo "$SA_BASE64" | base64 --decode > serviceAccountKey.json
-          ls -l serviceAccountKey.json
+          set -euo pipefail
 
-      - name: Run WQI script
+          # Prefer base64 secret if present
+          if [ -n "${SA_B64:-}" ]; then
+            echo "[INFO] Using FIREBASE_SA_JSON_B64 (base64)"
+            echo "$SA_B64" | base64 --decode > serviceAccountKey.json || (echo "base64 decode failed" && exit 1)
+          elif [ -n "${SA_RAW:-}" ]; then
+            echo "[INFO] Using FIREBASE_SA_JSON_RAW (raw JSON)"
+            echo "$SA_RAW" > serviceAccountKey.json
+          else
+            echo "ERROR: Neither FIREBASE_SA_JSON_B64 nor FIREBASE_SA_JSON_RAW secrets set"
+            exit 1
+          fi
+
+          # Basic file checks
+          echo "serviceAccountKey.json -> size: $(wc -c < serviceAccountKey.json) bytes"
+          echo "----- head (first 120 chars) -----"
+          head -c 120 serviceAccountKey.json | sed -n l || true
+          echo "----- tail (last 120 chars) -----"
+          tail -c 120 serviceAccountKey.json | sed -n l || true
+
+          # Validate JSON by trying to load it in Python
+          python - <<'PY'
+import json,sys
+try:
+    json.load(open("serviceAccountKey.json"))
+    print("✅ serviceAccountKey.json is valid JSON")
+except Exception as e:
+    print("❌ Invalid JSON in serviceAccountKey.json:", e)
+    sys.exit(2)
+PY
+
+      - name: Create artifacts directory (for ML artifacts)
+        run: |
+          mkdir -p artifacts
+          ls -la artifacts || true
+
+      - name: Run window-level WQI (one-shot)
         env:
-          GOOGLE_APPLICATION_CREDENTIALS: serviceAccountKey.json
-          FIREBASE_DB_URL: "https://mywaterproject-e6489-default-rtdb.asia-southeast1.firebasedatabase.app/"
-          FB_PATH_SENSOR: "sensor_readings"
-          FB_PATH_WATERLOGS: "waterLogs"
-          FB_PATH_RES_WINDOWS: "wqi_window_results"
-          ARTIFACT_DIR: "./artifacts"
-          USE_MODEL: "true"
-          FORCE_FULL_FETCH: "true"   # set to true first run to pull old records
+          # Firebase & service account
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/serviceAccountKey.json
+          FIREBASE_DB_URL: ${{ secrets.FIREBASE_DB_URL }}
+
+          # database paths (adjust if needed)
+          FB_PATH_SENSOR: sensor_readings
+          FB_PATH_WATERLOGS: waterLogs
+          FB_PATH_RES_WINDOWS: wqi_window_results
+
+          # timestamp/time parsing options
+          TIME_FIELD: timestamp
+          TZ_LOCAL: Asia/Kolkata
+
+          # windowing
+          WINDOW_SIZE: "10"
+          STEP_SIZE: "3"
+
+          # run once per cron tick (no infinite loop)
+          RUN_CONTINUOUS: "false"
+          # how far back to fetch each run (minutes)
           LOOKBACK_MIN: "120"
-          POLL_SECONDS: "20"
+
+          # ML options
+          USE_MODEL: "false"                # set to "true" only after placing artifacts in ./artifacts
+          ARTIFACT_DIR: ./artifacts
+          ACCEPTABLE_MODEL_CLASSES: '["low"]'
         run: |
+          echo "Running WQI window service (single pass)"
           python firebase_window_wqi_service.py
