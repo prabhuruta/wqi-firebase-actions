@@ -1,9 +1,7 @@
-name: WQI Window Service (cron)
+name: WQI Window Service (manual)
 
 on:
-  schedule:
-    - cron: "*/1 * * * *"   # every minute (UTC) — change as needed
-  workflow_dispatch:        # allow manual runs
+  workflow_dispatch: {}
 
 jobs:
   run-wqi:
@@ -11,10 +9,10 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - name: Checkout repository
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -24,60 +22,34 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Decode service account JSON (from base64 secret)
+      - name: Decode Firebase service account JSON (from secret)
         env:
           FIREBASE_SA_JSON_B64: ${{ secrets.FIREBASE_SA_JSON_B64 }}
         run: |
           set -euo pipefail
           if [ -z "${FIREBASE_SA_JSON_B64:-}" ]; then
-            echo "ERROR: secret FIREBASE_SA_JSON_B64 is empty. Add it in repo Settings → Secrets."
-            exit 1
+            echo "ERROR: FIREBASE_SA_JSON_B64 secret is missing"; exit 1
           fi
           echo "$FIREBASE_SA_JSON_B64" | base64 --decode > serviceAccountKey.json
-          echo "serviceAccountKey.json written. size: $(wc -c < serviceAccountKey.json) bytes"
-          # Validate JSON quickly
-          python - <<'PY'
-import json,sys
-try:
-    json.load(open("serviceAccountKey.json"))
-    print("✅ serviceAccountKey.json is valid JSON")
-except Exception as e:
-    print("❌ Invalid JSON in serviceAccountKey.json:", e)
-    sys.exit(2)
-PY
+          echo "Wrote serviceAccountKey.json (size: $(wc -c < serviceAccountKey.json) bytes)"
+          python -c "import json,sys; json.load(open('serviceAccountKey.json')); print('serviceAccountKey.json OK')"
 
-      - name: Create artifacts directory
-        run: |
-          mkdir -p artifacts
-          ls -la artifacts || true
-
-      - name: Run window-level WQI (single pass)
+      - name: Run WQI window script (single pass)
         env:
-          # Firebase & service account
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/serviceAccountKey.json
           FIREBASE_DB_URL: ${{ secrets.FIREBASE_DB_URL }}
-
-          # database paths
           FB_PATH_SENSOR: sensor_readings
           FB_PATH_WATERLOGS: waterLogs
           FB_PATH_RES_WINDOWS: wqi_window_results
-
-          # timestamp/time parsing options
           TIME_FIELD: timestamp
           TZ_LOCAL: Asia/Kolkata
-
-          # windowing
           WINDOW_SIZE: "10"
           STEP_SIZE: "3"
-
-          # run once per cron tick (no infinite loop)
           RUN_CONTINUOUS: "false"
           LOOKBACK_MIN: "10"
-
-          # model options (put artifacts under ./artifacts if you plan to use model)
           USE_MODEL: "false"
           ARTIFACT_DIR: ./artifacts
-          ACCEPTABLE_MODEL_CLASSES: '["low"]'
         run: |
-          echo "Running WQI window service (single pass)"
+          echo "Starting WQI window job"
+          ls -la
           python firebase_window_wqi_service.py
