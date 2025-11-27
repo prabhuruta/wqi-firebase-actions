@@ -24,32 +24,31 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      # --- Create & validate serviceAccountKey.json (supports base64 or raw secret) ---
       - name: Create & validate service account JSON from secret
         env:
-          SA_B64: ${{ secrets.FIREBASE_SA_JSON_B64 }}
-          SA_RAW: ${{ secrets.FIREBASE_SA_JSON_RAW }}
+          FIREBASE_SA_JSON_B64: ${{ secrets.FIREBASE_SA_JSON_B64 }}
+          FIREBASE_SA_JSON_RAW: ${{ secrets.FIREBASE_SA_JSON_RAW }}
         run: |
           set -euo pipefail
 
           # Prefer base64 secret if present
-          if [ -n "${SA_B64:-}" ]; then
+          if [ -n "${FIREBASE_SA_JSON_B64:-}" ]; then
             echo "[INFO] Using FIREBASE_SA_JSON_B64 (base64)"
-            echo "$SA_B64" | base64 --decode > serviceAccountKey.json || (echo "base64 decode failed" && exit 1)
-          elif [ -n "${SA_RAW:-}" ]; then
+            echo "$FIREBASE_SA_JSON_B64" | base64 --decode > serviceAccountKey.json
+          elif [ -n "${FIREBASE_SA_JSON_RAW:-}" ]; then
             echo "[INFO] Using FIREBASE_SA_JSON_RAW (raw JSON)"
-            echo "$SA_RAW" > serviceAccountKey.json
+            echo "$FIREBASE_SA_JSON_RAW" > serviceAccountKey.json
           else
-            echo "ERROR: Neither FIREBASE_SA_JSON_B64 nor FIREBASE_SA_JSON_RAW secrets set"
+            echo "ERROR: Set either FIREBASE_SA_JSON_B64 or FIREBASE_SA_JSON_RAW secret."
             exit 1
           fi
 
           # Basic file checks
           echo "serviceAccountKey.json -> size: $(wc -c < serviceAccountKey.json) bytes"
-          echo "----- head (first 120 chars) -----"
-          head -c 120 serviceAccountKey.json | sed -n l || true
-          echo "----- tail (last 120 chars) -----"
-          tail -c 120 serviceAccountKey.json | sed -n l || true
+          echo "----- head (first 200 chars) -----"
+          head -c 200 serviceAccountKey.json | sed -n l || true
+          echo "----- tail (last 200 chars) -----"
+          tail -c 200 serviceAccountKey.json | sed -n l || true
 
           # Validate JSON by trying to load it in Python
           python - <<'PY'
@@ -91,8 +90,8 @@ PY
           # how far back to fetch each run (minutes)
           LOOKBACK_MIN: "10"
 
-          # ML options
-          USE_MODEL: "false"                # set to "true" only after placing artifacts in ./artifacts
+          # ML options (set to "true" only after placing artifacts in ./artifacts)
+          USE_MODEL: "false"
           ARTIFACT_DIR: ./artifacts
           ACCEPTABLE_MODEL_CLASSES: '["low"]'
         run: |
