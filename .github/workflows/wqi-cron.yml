@@ -47,7 +47,7 @@ jobs:
           STEP_SIZE: "3"
           RUN_CONTINUOUS: "false"
           LOOKBACK_MIN: "10"
-          USE_MODEL: "false"
+          USE_MODEL: "true"
           ARTIFACT_DIR: ./artifacts
         run: |
           echo "Starting WQI window job"
