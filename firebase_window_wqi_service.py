@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
 firebase_window_wqi_service.py
-Window-level WQI + optional ML (HMM + XGBoost)
-Safe for GitHub Actions, Firebase RTDB, and dashboards
+
+Reads sensor_readings and waterLogs from Firebase RTDB,
+creates sliding windows, computes WQI, applies rule checks,
+runs HMM + XGBoost model, and writes window-level results
+(with timestamps preserved) to wqi_window_results.
 """
 
 import os, time, json, math, warnings
@@ -14,64 +17,62 @@ import pandas as pd
 import firebase_admin
 from firebase_admin import credentials, db
 
-# ML artifacts
+# ML
 from joblib import load as joblib_load
 
 warnings.filterwarnings("ignore")
 
 # ======================================================
-# CONFIGURATION (ENV VARIABLES)
+# CONFIG (ENV VARS)
 # ======================================================
 FIREBASE_DB_URL = os.getenv("FIREBASE_DB_URL")
 SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 
 PATH_SENSOR = os.getenv("FB_PATH_SENSOR", "sensor_readings")
 PATH_WATERLOGS = os.getenv("FB_PATH_WATERLOGS", "waterLogs")
-PATH_OUTPUT = os.getenv("FB_PATH_RES_WINDOWS", "wqi_window_results")
+PATH_RES_WINDOWS = os.getenv("FB_PATH_RES_WINDOWS", "wqi_window_results")
 
 TIME_FIELD = os.getenv("TIME_FIELD", "timestamp")
+ASOF_TOL_SEC = int(os.getenv("ASOF_TOL_SEC", "30"))
 
 WINDOW_SIZE = int(os.getenv("WINDOW_SIZE", "10"))
 STEP_SIZE = int(os.getenv("STEP_SIZE", "3"))
-LOOKBACK_MIN = int(os.getenv("LOOKBACK_MIN", "180"))
 
 RUN_CONTINUOUS = os.getenv("RUN_CONTINUOUS", "false").lower() == "true"
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))
+LOOKBACK_MIN = int(os.getenv("LOOKBACK_MIN", "10"))
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "20"))
 
-USE_MODEL = os.getenv("USE_MODEL", "false").lower() == "true"
+USE_MODEL = os.getenv("USE_MODEL", "true").lower() == "true"
 ART_DIR = os.getenv("ARTIFACT_DIR", "./artifacts")
-ACCEPTABLE_MODEL_CLASSES = set(json.loads(os.getenv("ACCEPTABLE_MODEL_CLASSES", '["low"]')))
+
+ACCEPTABLE_MODEL_CLASSES = set(
+    json.loads(os.getenv("ACCEPTABLE_MODEL_CLASSES", '["low"]'))
+)
 
 # ======================================================
 # WQI CONFIG
 # ======================================================
 WQI_WEIGHTS = {
-    "pH": 0.2,
-    "dissolvedO2": 0.2,
-    "turbidity": 0.2,
-    "tds": 0.2,
-    "temp": 0.1,
-    "chlorophyll": 0.1,
+    "pH": 0.20,
+    "dissolvedO2": 0.20,
+    "turbidity": 0.20,
+    "tds": 0.20,
+    "temp": 0.10,
+    "chlorophyll": 0.10
 }
 
 DRINK_LIMITS = {
     "pH": (6.5, 8.5),
-    "dissolvedO2": (5.0, 100),
-    "turbidity": (0, 5),
-    "tds": (0, 500),
-}
-
-FIELD_ALIASES = {
-    "chlorophyll_ug_per_L": "chlorophyll",
-    "chl_temp_C": "chl_temp",
-    "bga_temp_C": "bga_temp",
-    "blue_green_algae_cells_per_mL": "bga",
+    "dissolvedO2": (5.0, np.inf),
+    "turbidity": (0.0, 5.0),
+    "tds": (0.0, 500.0),
+    "temp": (5.0, 30.0),
+    "chlorophyll": (0.0, 30.0)
 }
 
 SENSOR_FIELDS = [
-    "pH", "dissolvedO2", "turbidity", "tds",
-    "temp", "chlorophyll", "orp",
-    "bga", "bga_temp", "chl_temp"
+    "pH","dissolvedO2","turbidity","tds","temp",
+    "chlorophyll","orp","bga","bga_temp","chl_temp","lat","lon"
 ]
 
 # ======================================================
@@ -81,23 +82,21 @@ def init_firebase():
     if not firebase_admin._apps:
         cred = credentials.Certificate(SERVICE_ACCOUNT_JSON)
         firebase_admin.initialize_app(cred, {"databaseURL": FIREBASE_DB_URL})
+    return db
 
 # ======================================================
 # TIMESTAMP PARSER (NO CONVERSION)
 # ======================================================
-def parse_ts(val):
-    if pd.isna(val):
-        return None
-    s = str(val).strip()
-
-    try:
-        return datetime.strptime(s, "%d-%m-%Y %H:%M:%S")
-    except:
+def parse_any_ts(series):
+    out = []
+    for v in series:
         try:
-            dt = pd.to_datetime(s, errors="coerce")
-            return dt.to_pydatetime() if not pd.isna(dt) else None
+            dt = datetime.strptime(str(v), "%d-%m-%Y %H:%M:%S")
+            out.append(dt)
         except:
-            return None
+            dt = pd.to_datetime(v, errors="coerce")
+            out.append(dt if not pd.isna(dt) else np.nan)
+    return pd.Series(out, dtype="datetime64[ns]")
 
 # ======================================================
 # FETCH DATA
@@ -108,124 +107,130 @@ def fetch_node(path, since_ts=None):
     if not rows:
         return pd.DataFrame()
 
-    df = pd.DataFrame(rows).rename(columns=FIELD_ALIASES)
+    df = pd.DataFrame(rows)
+
+    if TIME_FIELD not in df.columns:
+        for c in ["timestamp", "time"]:
+            if c in df.columns:
+                df[TIME_FIELD] = df[c]
+                break
 
     if TIME_FIELD not in df.columns:
         return pd.DataFrame()
 
-    df["ts"] = df[TIME_FIELD].apply(parse_ts)
+    df["ts"] = parse_any_ts(df[TIME_FIELD])
     df = df.dropna(subset=["ts"]).sort_values("ts")
 
-    if since_ts:
+    if since_ts is not None:
         df = df[df["ts"] > since_ts]
 
     return df.reset_index(drop=True)
 
 # ======================================================
-# WQI FUNCTIONS
+# WINDOWING
+# ======================================================
+def sliding_windows(n, size, step):
+    i = 0
+    while i + size <= n:
+        yield i, i + size
+        i += step
+
+def aggregate_window(dfw):
+    stats = {}
+    for c in SENSOR_FIELDS:
+        if c in dfw.columns:
+            stats[c] = float(pd.to_numeric(dfw[c], errors="coerce").mean())
+    stats["n_readings"] = len(dfw)
+    return stats
+
+# ======================================================
+# WQI
 # ======================================================
 def score_param(name, v):
-    if v is None or np.isnan(v):
-        return 0
-    if name == "pH":
-        return 100 if 7 <= v <= 8 else 60
-    if name == "dissolvedO2":
-        return min(100, v * 12.5)
-    if name == "turbidity":
-        return max(0, 100 - 15 * v)
-    if name == "tds":
-        return 100 if v <= 300 else max(0, 100 - (v - 300) * 0.1)
-    if name == "temp":
-        return 100 if 15 <= v <= 25 else 70
-    if name == "chlorophyll":
-        return max(0, 100 - v * 2)
+    if v is None or np.isnan(v): return 0
+    if name == "pH": return 100 if 7 <= v <= 8 else 60
+    if name == "dissolvedO2": return min(100, v * 12.5)
+    if name == "turbidity": return max(0, 100 - 15*v)
+    if name == "tds": return 100 if v <= 300 else max(0, 100 - (v-300)*0.1)
+    if name == "temp": return 100 if 15 <= v <= 25 else 70
+    if name == "chlorophyll": return max(0, 100 - v*2)
     return 50
 
 def compute_wqi(stats):
     total, wsum = 0, 0
-    for k, w in WQI_WEIGHTS.items():
+    for k,w in WQI_WEIGHTS.items():
         s = score_param(k, stats.get(k))
-        wsum += s * w
+        wsum += w*s
         total += w
-    wqi = round(wsum / total, 2)
-    cat = "Excellent" if wqi >= 90 else "Good" if wqi >= 70 else "Fair" if wqi >= 50 else "Poor"
-    return wqi, cat
+    wqi = wsum/total if total else 0
+    cat = "Excellent" if wqi>=90 else "Good" if wqi>=70 else "Fair" if wqi>=50 else "Poor"
+    return round(wqi,2), cat
 
 # ======================================================
-# WINDOW AGGREGATION
+# ML MODEL
 # ======================================================
-def aggregate(win):
-    out = {}
-    for c in SENSOR_FIELDS:
-        if c in win:
-            out[c] = float(pd.to_numeric(win[c], errors="coerce").mean())
-    out["n_readings"] = len(win)
-    return out
-
-# ======================================================
-# OPTIONAL ML
-# ======================================================
-class OptionalModel:
-    def __init__(self, d):
-        self.scaler = joblib_load(f"{d}/scaler.joblib")
-        self.hmm = joblib_load(f"{d}/hmm_model.joblib")
-        self.xgb = joblib_load(f"{d}/xgb_model.joblib")
-        self.features = json.load(open(f"{d}/final_feature_order.json"))
-        self.le = joblib_load(f"{d}/label_encoder.joblib")
+class MLModel:
+    def __init__(self, path):
+        self.scaler = joblib_load(f"{path}/scaler.joblib")
+        self.hmm = joblib_load(f"{path}/hmm_model.joblib")
+        self.xgb = joblib_load(f"{path}/xgb_model.joblib")
+        self.le = joblib_load(f"{path}/label_encoder.joblib")
+        with open(f"{path}/final_feature_order.json") as f:
+            self.features = json.load(f)
 
     def predict(self, df):
-        X = np.nan_to_num(df[self.features].values)
+        X = np.column_stack([
+            pd.to_numeric(df.get(f, 0), errors="coerce").fillna(0)
+            for f in self.features
+        ])
         Xs = self.scaler.transform(X)
-        _, post = self.hmm.score_samples(Xs)
-        Xh = np.hstack([Xs, post])
+        logp, post = self.hmm.score_samples(Xs)
+        Xh = np.hstack([Xs, post, logp.reshape(-1,1)])
         y = self.xgb.predict(Xh)
-        return self.le.inverse_transform(y)
+        p = self.xgb.predict_proba(Xh).max(axis=1)
+        return self.le.inverse_transform(y), p
 
 # ======================================================
 # MAIN PROCESS
 # ======================================================
-def process_once(since_ts=None):
+def process_once(since_ts, model):
     df1 = fetch_node(PATH_SENSOR, since_ts)
     df2 = fetch_node(PATH_WATERLOGS, since_ts)
 
+    if df1.empty and df2.empty:
+        return since_ts
+
     df = pd.concat([df1, df2]).sort_values("ts").reset_index(drop=True)
     if len(df) < WINDOW_SIZE:
-        return None
+        return df["ts"].max()
 
-    model = OptionalModel(ART_DIR) if USE_MODEL else None
-    ref = db.reference(PATH_OUTPUT)
-
-    for i in range(0, len(df) - WINDOW_SIZE + 1, STEP_SIZE):
-        win = df.iloc[i:i + WINDOW_SIZE]
-
-        stats = aggregate(win)
+    out = []
+    for s,e in sliding_windows(len(df), WINDOW_SIZE, STEP_SIZE):
+        win = df.iloc[s:e]
+        stats = aggregate_window(win)
         wqi, cat = compute_wqi(stats)
 
-        payload = {
+        row = {
             **stats,
             "wqi": wqi,
             "wqi_category": cat,
-            "window_start": win["ts"].iloc[0].isoformat(),
-            "window_end": win["ts"].iloc[-1].isoformat(),
-            "window_center": (
-                win["ts"].iloc[0] +
-                (win["ts"].iloc[-1] - win["ts"].iloc[0]) / 2
-            ).isoformat(),
+            "window_start_ts": int(win["ts"].iloc[0].timestamp()*1000),
+            "window_end_ts": int(win["ts"].iloc[-1].timestamp()*1000),
+            "window_start_iso": win["ts"].iloc[0].isoformat(),
+            "window_end_iso": win["ts"].iloc[-1].isoformat()
         }
+        out.append(row)
 
-        # CLEAN NaN FOR FIREBASE
-        payload = {
-            k: (None if isinstance(v, float) and np.isnan(v) else v)
-            for k, v in payload.items()
-        }
+    out_df = pd.DataFrame(out)
 
-        if model:
-            cls = model.predict(pd.DataFrame([payload]))[0]
-            payload["model_class"] = cls
-            payload["final_drinkable"] = cls in ACCEPTABLE_MODEL_CLASSES
-        else:
-            payload["final_drinkable"] = True
+    if model:
+        cls, conf = model.predict(out_df)
+        out_df["model_class"] = cls
+        out_df["model_conf"] = conf
 
+    ref = db.reference(PATH_RES_WINDOWS)
+    for _,r in out_df.iterrows():
+        payload = {k:(None if pd.isna(v) else v) for k,v in r.items()}
         ref.push(payload)
 
     return df["ts"].max()
@@ -235,14 +240,18 @@ def process_once(since_ts=None):
 # ======================================================
 def main():
     init_firebase()
-    since = datetime.now() - pd.Timedelta(minutes=LOOKBACK_MIN)
+    print("Connected to Firebase")
 
-    if RUN_CONTINUOUS:
-        while True:
-            since = process_once(since) or since
-            time.sleep(POLL_SECONDS)
-    else:
-        process_once(since)
+    model = MLModel(ART_DIR) if USE_MODEL else None
+    since_ts = pd.Timestamp.now() - pd.Timedelta(minutes=LOOKBACK_MIN)
+
+    if not RUN_CONTINUOUS:
+        process_once(since_ts, model)
+        return
+
+    while True:
+        since_ts = process_once(since_ts, model)
+        time.sleep(POLL_SECONDS)
 
 if __name__ == "__main__":
     main()
