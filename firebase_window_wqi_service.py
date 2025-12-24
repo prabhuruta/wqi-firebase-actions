@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
 firebase_window_wqi_service.py
-
-HISTORICAL + ML-MANDATORY VERSION
-- Processes ALL past readings
-- ML model ALWAYS runs
-- No duplicate window writes
+FINAL STABLE VERSION
+- Fetches ALL historical data
+- Sliding window WQI
+- ML (HMM + XGBoost) ALWAYS runs
+- Safe aggregation (no crashes)
+- Writes window_start & window_end timestamps
 """
 
 import os
@@ -31,14 +32,12 @@ PATH_WATERLOGS = os.getenv("FB_PATH_WATERLOGS", "waterLogs")
 PATH_OUT = os.getenv("FB_PATH_RES_WINDOWS", "wqi_window_results")
 
 TIME_FIELD = os.getenv("TIME_FIELD", "timestamp")
-
 WINDOW_SIZE = int(os.getenv("WINDOW_SIZE", "10"))
 STEP_SIZE = int(os.getenv("STEP_SIZE", "3"))
-
 ART_DIR = os.getenv("ARTIFACT_DIR", "./artifacts")
 
 # ==============================
-# FEATURE FIELDS (TRAINING-COMPATIBLE)
+# FEATURES (TRAINING-COMPATIBLE)
 # ==============================
 FEATURE_FIELDS = [
     "pH", "dissolvedO2", "turbidity", "tds", "temp",
@@ -46,18 +45,16 @@ FEATURE_FIELDS = [
 ]
 
 # ==============================
-# FIREBASE INIT
+# INIT FIREBASE
 # ==============================
 def init_firebase():
     if not firebase_admin._apps:
         cred = credentials.Certificate(SERVICE_ACCOUNT_JSON)
-        firebase_admin.initialize_app(
-            cred, {"databaseURL": FIREBASE_DB_URL}
-        )
+        firebase_admin.initialize_app(cred, {"databaseURL": FIREBASE_DB_URL})
     print("✅ Firebase connected")
 
 # ==============================
-# SAFE TIMESTAMP PARSER
+# TIMESTAMP PARSER
 # ==============================
 def parse_ts(v):
     try:
@@ -69,53 +66,47 @@ def parse_ts(v):
             return None
 
 # ==============================
-# FETCH ENTIRE NODE (NO TIME FILTER)
+# FETCH ALL DATA
 # ==============================
 def fetch_node(path):
     data = db.reference(path).get() or {}
     rows = []
-
     for _, v in data.items():
         if not isinstance(v, dict):
             continue
-
         ts = parse_ts(v.get(TIME_FIELD))
-        if ts is None:
-            continue
-
-        v["ts"] = ts
-        rows.append(v)
-
+        if ts:
+            v["ts"] = ts
+            rows.append(v)
     return pd.DataFrame(rows)
 
 # ==============================
-# WINDOW AGGREGATION
+# WINDOW AGGREGATION (FIXED)
 # ==============================
 def aggregate_window(df):
     stats = {}
     for c in FEATURE_FIELDS:
-        stats[c] = float(
-            pd.to_numeric(df.get(c, 0), errors="coerce").mean()
-        )
+        if c in df.columns:
+            stats[c] = float(pd.to_numeric(df[c], errors="coerce").mean())
+        else:
+            stats[c] = 0.0
     stats["n_readings"] = len(df)
     return stats
 
 # ==============================
-# WQI (RULE-BASED)
+# WQI COMPUTATION
 # ==============================
 def compute_wqi(stats):
     weights = {
         "pH": 0.2, "dissolvedO2": 0.2, "turbidity": 0.2,
         "tds": 0.2, "temp": 0.1, "chlorophyll": 0.1
     }
-
     score = 0.0
     for k, w in weights.items():
-        v = stats.get(k, 0)
+        v = stats.get(k, 0.0)
         if np.isnan(v):
-            v = 0
+            v = 0.0
         score += w * min(100, max(0, v * 10))
-
     return round(score, 2)
 
 # ==============================
@@ -127,22 +118,16 @@ class MLModel:
         self.hmm = joblib_load(os.path.join(art_dir, "hmm_model.joblib"))
         self.xgb = joblib_load(os.path.join(art_dir, "xgb_model.joblib"))
         self.le = joblib_load(os.path.join(art_dir, "label_encoder.joblib"))
-
         with open(os.path.join(art_dir, "final_feature_order.json")) as f:
             self.features = json.load(f)
-
         print("✅ ML artifacts loaded")
 
     def predict(self, stats_df):
         X = []
         for c in self.features:
-            X.append(
-                pd.to_numeric(stats_df.get(c, 0), errors="coerce")
-                .fillna(0)
-                .values
-            )
-
+            X.append(pd.to_numeric(stats_df.get(c, 0), errors="coerce").fillna(0).values)
         X = np.column_stack(X)
+
         Xs = self.scaler.transform(X)
 
         logprob, post = self.hmm.score_samples(Xs)
@@ -156,7 +141,7 @@ class MLModel:
         return self.le.inverse_transform(y), conf
 
 # ==============================
-# MAIN PIPELINE
+# MAIN
 # ==============================
 def main():
     init_firebase()
@@ -166,46 +151,34 @@ def main():
     df2 = fetch_node(PATH_WATERLOGS)
 
     df = pd.concat([df1, df2], ignore_index=True)
-
     if df.empty:
-        print("⚠️ No data found in Firebase")
+        print("⚠️ No data found")
         return
 
     df = df.sort_values("ts").reset_index(drop=True)
 
     model = MLModel(ART_DIR)
-    out_ref = db.reference(PATH_OUT)
-
-    pushed = 0
+    ref = db.reference(PATH_OUT)
 
     for i in range(0, len(df) - WINDOW_SIZE + 1, STEP_SIZE):
         win = df.iloc[i:i + WINDOW_SIZE]
-
         stats = aggregate_window(win)
-        wqi = compute_wqi(stats)
-
-        cls, conf = model.predict(pd.DataFrame([stats]))
-
-        window_id = (
-            f"{win['ts'].iloc[0].isoformat()}_"
-            f"{win['ts'].iloc[-1].isoformat()}"
-        )
 
         payload = {
             **stats,
-            "wqi": wqi,
-            "model_class": cls[0],
-            "model_conf": float(conf[0]),
+            "wqi": compute_wqi(stats),
             "window_start_iso": win["ts"].iloc[0].isoformat(),
             "window_end_iso": win["ts"].iloc[-1].isoformat(),
             "created_at": datetime.utcnow().isoformat()
         }
 
-        out_ref.child(window_id).set(payload)
-        pushed += 1
+        cls, conf = model.predict(pd.DataFrame([stats]))
+        payload["model_class"] = cls[0]
+        payload["model_conf"] = float(conf[0])
 
-    print(f"✅ {pushed} historical WQI windows written to Firebase")
+        ref.push(payload)
 
-# ==============================
+    print("✅ ALL WQI windows pushed successfully")
+
 if __name__ == "__main__":
     main()
