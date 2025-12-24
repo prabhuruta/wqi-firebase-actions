@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 """
 firebase_window_wqi_service.py
-FINAL STABLE VERSION
-- Fetches ALL historical data
-- Sliding window WQI
-- ML (HMM + XGBoost) ALWAYS runs
-- Safe aggregation (no crashes)
-- Writes window_start & window_end timestamps
+FINAL FIXED VERSION
+- ML always runs
+- ALL historical data
+- Correct XGB output handling
+- No shape errors
 """
 
 import os
 import json
-import math
 from datetime import datetime
 
 import numpy as np
@@ -37,7 +35,7 @@ STEP_SIZE = int(os.getenv("STEP_SIZE", "3"))
 ART_DIR = os.getenv("ARTIFACT_DIR", "./artifacts")
 
 # ==============================
-# FEATURES (TRAINING-COMPATIBLE)
+# FEATURES (TRAINING MATCH)
 # ==============================
 FEATURE_FIELDS = [
     "pH", "dissolvedO2", "turbidity", "tds", "temp",
@@ -45,7 +43,7 @@ FEATURE_FIELDS = [
 ]
 
 # ==============================
-# INIT FIREBASE
+# FIREBASE INIT
 # ==============================
 def init_firebase():
     if not firebase_admin._apps:
@@ -81,7 +79,7 @@ def fetch_node(path):
     return pd.DataFrame(rows)
 
 # ==============================
-# WINDOW AGGREGATION (FIXED)
+# WINDOW AGGREGATION (SAFE)
 # ==============================
 def aggregate_window(df):
     stats = {}
@@ -94,7 +92,7 @@ def aggregate_window(df):
     return stats
 
 # ==============================
-# WQI COMPUTATION
+# WQI
 # ==============================
 def compute_wqi(stats):
     weights = {
@@ -110,7 +108,7 @@ def compute_wqi(stats):
     return round(score, 2)
 
 # ==============================
-# ML MODEL (MANDATORY)
+# ML MODEL (FIXED)
 # ==============================
 class MLModel:
     def __init__(self, art_dir):
@@ -123,22 +121,27 @@ class MLModel:
         print("✅ ML artifacts loaded")
 
     def predict(self, stats_df):
+        # Feature vector
         X = []
         for c in self.features:
             X.append(pd.to_numeric(stats_df.get(c, 0), errors="coerce").fillna(0).values)
         X = np.column_stack(X)
 
+        # Scale
         Xs = self.scaler.transform(X)
 
+        # HMM features
         logprob, post = self.hmm.score_samples(Xs)
         logfeat = np.full((len(Xs), 1), logprob / max(1, len(Xs)))
 
         Xh = np.hstack([Xs, post, logfeat])
 
-        y = self.xgb.predict(Xh)
-        conf = self.xgb.predict_proba(Xh).max(axis=1)
+        # 🔥 FIX: use probabilities → argmax
+        proba = self.xgb.predict_proba(Xh)
+        y_idx = np.argmax(proba, axis=1)
+        conf = proba.max(axis=1)
 
-        return self.le.inverse_transform(y), conf
+        return self.le.inverse_transform(y_idx), conf
 
 # ==============================
 # MAIN
@@ -164,17 +167,17 @@ def main():
         win = df.iloc[i:i + WINDOW_SIZE]
         stats = aggregate_window(win)
 
+        cls, conf = model.predict(pd.DataFrame([stats]))
+
         payload = {
             **stats,
             "wqi": compute_wqi(stats),
             "window_start_iso": win["ts"].iloc[0].isoformat(),
             "window_end_iso": win["ts"].iloc[-1].isoformat(),
+            "model_class": cls[0],
+            "model_conf": float(conf[0]),
             "created_at": datetime.utcnow().isoformat()
         }
-
-        cls, conf = model.predict(pd.DataFrame([stats]))
-        payload["model_class"] = cls[0]
-        payload["model_conf"] = float(conf[0])
 
         ref.push(payload)
 
