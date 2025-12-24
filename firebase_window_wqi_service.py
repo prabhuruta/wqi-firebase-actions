@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
 firebase_window_wqi_service.py
-Stable + ML-safe + Firebase-safe version
+
+HISTORICAL + ML-MANDATORY VERSION
+- Processes ALL past readings
+- ML model ALWAYS runs
+- No duplicate window writes
 """
 
 import os
 import json
 import math
-import time
 from datetime import datetime
 
 import numpy as np
@@ -28,15 +31,14 @@ PATH_WATERLOGS = os.getenv("FB_PATH_WATERLOGS", "waterLogs")
 PATH_OUT = os.getenv("FB_PATH_RES_WINDOWS", "wqi_window_results")
 
 TIME_FIELD = os.getenv("TIME_FIELD", "timestamp")
-LOOKBACK_MIN = int(os.getenv("LOOKBACK_MIN", "60"))
+
 WINDOW_SIZE = int(os.getenv("WINDOW_SIZE", "10"))
 STEP_SIZE = int(os.getenv("STEP_SIZE", "3"))
 
-USE_MODEL = os.getenv("USE_MODEL", "true").lower() == "true"
 ART_DIR = os.getenv("ARTIFACT_DIR", "./artifacts")
 
 # ==============================
-# SENSOR FIELDS (TRAINING-COMPATIBLE)
+# FEATURE FIELDS (TRAINING-COMPATIBLE)
 # ==============================
 FEATURE_FIELDS = [
     "pH", "dissolvedO2", "turbidity", "tds", "temp",
@@ -44,13 +46,15 @@ FEATURE_FIELDS = [
 ]
 
 # ==============================
-# INIT FIREBASE
+# FIREBASE INIT
 # ==============================
 def init_firebase():
     if not firebase_admin._apps:
         cred = credentials.Certificate(SERVICE_ACCOUNT_JSON)
-        firebase_admin.initialize_app(cred, {"databaseURL": FIREBASE_DB_URL})
-    print("✅ Connected to Firebase")
+        firebase_admin.initialize_app(
+            cred, {"databaseURL": FIREBASE_DB_URL}
+        )
+    print("✅ Firebase connected")
 
 # ==============================
 # SAFE TIMESTAMP PARSER
@@ -65,48 +69,57 @@ def parse_ts(v):
             return None
 
 # ==============================
-# FETCH NODE
+# FETCH ENTIRE NODE (NO TIME FILTER)
 # ==============================
-def fetch_node(path, since_ts):
+def fetch_node(path):
     data = db.reference(path).get() or {}
     rows = []
-    for k, v in data.items():
+
+    for _, v in data.items():
         if not isinstance(v, dict):
             continue
+
         ts = parse_ts(v.get(TIME_FIELD))
-        if ts and ts > since_ts:
-            v["ts"] = ts
-            rows.append(v)
+        if ts is None:
+            continue
+
+        v["ts"] = ts
+        rows.append(v)
+
     return pd.DataFrame(rows)
 
 # ==============================
 # WINDOW AGGREGATION
 # ==============================
 def aggregate_window(df):
-    out = {}
+    stats = {}
     for c in FEATURE_FIELDS:
-        out[c] = float(pd.to_numeric(df.get(c, 0), errors="coerce").mean())
-    out["n_readings"] = len(df)
-    return out
+        stats[c] = float(
+            pd.to_numeric(df.get(c, 0), errors="coerce").mean()
+        )
+    stats["n_readings"] = len(df)
+    return stats
 
 # ==============================
-# WQI
+# WQI (RULE-BASED)
 # ==============================
 def compute_wqi(stats):
-    score = 0
     weights = {
         "pH": 0.2, "dissolvedO2": 0.2, "turbidity": 0.2,
         "tds": 0.2, "temp": 0.1, "chlorophyll": 0.1
     }
+
+    score = 0.0
     for k, w in weights.items():
         v = stats.get(k, 0)
         if np.isnan(v):
             v = 0
         score += w * min(100, max(0, v * 10))
+
     return round(score, 2)
 
 # ==============================
-# ML MODEL (FIXED)
+# ML MODEL (MANDATORY)
 # ==============================
 class MLModel:
     def __init__(self, art_dir):
@@ -114,19 +127,24 @@ class MLModel:
         self.hmm = joblib_load(os.path.join(art_dir, "hmm_model.joblib"))
         self.xgb = joblib_load(os.path.join(art_dir, "xgb_model.joblib"))
         self.le = joblib_load(os.path.join(art_dir, "label_encoder.joblib"))
+
         with open(os.path.join(art_dir, "final_feature_order.json")) as f:
             self.features = json.load(f)
+
         print("✅ ML artifacts loaded")
 
-    def predict(self, df):
+    def predict(self, stats_df):
         X = []
         for c in self.features:
-            X.append(pd.to_numeric(df.get(c, 0), errors="coerce").fillna(0).values)
-        X = np.column_stack(X)
+            X.append(
+                pd.to_numeric(stats_df.get(c, 0), errors="coerce")
+                .fillna(0)
+                .values
+            )
 
+        X = np.column_stack(X)
         Xs = self.scaler.transform(X)
 
-        # 🔥 CRITICAL FIX: add log-likelihood feature
         logprob, post = self.hmm.score_samples(Xs)
         logfeat = np.full((len(Xs), 1), logprob / max(1, len(Xs)))
 
@@ -138,46 +156,56 @@ class MLModel:
         return self.le.inverse_transform(y), conf
 
 # ==============================
-# MAIN
+# MAIN PIPELINE
 # ==============================
 def main():
     init_firebase()
 
-    since_ts = datetime.now() - pd.Timedelta(minutes=LOOKBACK_MIN)
-
-    df1 = fetch_node(PATH_SENSOR, since_ts)
-    df2 = fetch_node(PATH_WATERLOGS, since_ts)
+    print("📥 Fetching ALL historical data...")
+    df1 = fetch_node(PATH_SENSOR)
+    df2 = fetch_node(PATH_WATERLOGS)
 
     df = pd.concat([df1, df2], ignore_index=True)
+
     if df.empty:
-        print("⚠️ No new data")
+        print("⚠️ No data found in Firebase")
         return
 
     df = df.sort_values("ts").reset_index(drop=True)
 
-    model = MLModel(ART_DIR) if USE_MODEL else None
-    ref = db.reference(PATH_OUT)
+    model = MLModel(ART_DIR)
+    out_ref = db.reference(PATH_OUT)
+
+    pushed = 0
 
     for i in range(0, len(df) - WINDOW_SIZE + 1, STEP_SIZE):
         win = df.iloc[i:i + WINDOW_SIZE]
+
         stats = aggregate_window(win)
+        wqi = compute_wqi(stats)
+
+        cls, conf = model.predict(pd.DataFrame([stats]))
+
+        window_id = (
+            f"{win['ts'].iloc[0].isoformat()}_"
+            f"{win['ts'].iloc[-1].isoformat()}"
+        )
 
         payload = {
             **stats,
-            "wqi": compute_wqi(stats),
+            "wqi": wqi,
+            "model_class": cls[0],
+            "model_conf": float(conf[0]),
             "window_start_iso": win["ts"].iloc[0].isoformat(),
             "window_end_iso": win["ts"].iloc[-1].isoformat(),
             "created_at": datetime.utcnow().isoformat()
         }
 
-        if model:
-            cls, conf = model.predict(pd.DataFrame([stats]))
-            payload["model_class"] = cls[0]
-            payload["model_conf"] = float(conf[0])
+        out_ref.child(window_id).set(payload)
+        pushed += 1
 
-        ref.push(payload)
+    print(f"✅ {pushed} historical WQI windows written to Firebase")
 
-    print("✅ WQI windows pushed")
-
+# ==============================
 if __name__ == "__main__":
     main()
