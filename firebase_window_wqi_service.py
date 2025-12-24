@@ -1,17 +1,12 @@
 #!/usr/bin/env python3
 """
 firebase_window_wqi_service.py
-FINAL FIXED VERSION
-- ML always runs
-- ALL historical data
-- Correct XGB output handling
-- No shape errors
+FINAL STABLE VERSION
 """
 
 import os
 import json
 from datetime import datetime
-
 import numpy as np
 import pandas as pd
 
@@ -19,9 +14,9 @@ import firebase_admin
 from firebase_admin import credentials, db
 from joblib import load as joblib_load
 
-# ==============================
-# ENV CONFIG
-# ==============================
+# =========================
+# ENV
+# =========================
 FIREBASE_DB_URL = os.getenv("FIREBASE_DB_URL")
 SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 
@@ -32,29 +27,42 @@ PATH_OUT = os.getenv("FB_PATH_RES_WINDOWS", "wqi_window_results")
 TIME_FIELD = os.getenv("TIME_FIELD", "timestamp")
 WINDOW_SIZE = int(os.getenv("WINDOW_SIZE", "10"))
 STEP_SIZE = int(os.getenv("STEP_SIZE", "3"))
+
 ART_DIR = os.getenv("ARTIFACT_DIR", "./artifacts")
 
-# ==============================
-# FEATURES (TRAINING MATCH)
-# ==============================
+# =========================
+# FEATURE SET (TRAINING MATCH)
+# =========================
 FEATURE_FIELDS = [
     "pH", "dissolvedO2", "turbidity", "tds", "temp",
     "chlorophyll", "orp", "bga", "bga_temp", "chl_temp"
 ]
 
-# ==============================
+# Firebase → Model field mapping
+COLUMN_ALIASES = {
+    "tempC": "temp",
+    "bga_temp_C": "bga_temp",
+    "chl_temp_C": "chl_temp",
+    "chlorophylll": "chlorophyll",
+    "chlorophyll_ug_per_L": "chlorophyll",
+    "blue_green_algae_cells_per_mL": "bga"
+}
+
+# =========================
 # FIREBASE INIT
-# ==============================
+# =========================
 def init_firebase():
     if not firebase_admin._apps:
         cred = credentials.Certificate(SERVICE_ACCOUNT_JSON)
         firebase_admin.initialize_app(cred, {"databaseURL": FIREBASE_DB_URL})
     print("✅ Firebase connected")
 
-# ==============================
-# TIMESTAMP PARSER
-# ==============================
+# =========================
+# SAFE TIMESTAMP
+# =========================
 def parse_ts(v):
+    if v is None:
+        return None
     try:
         return datetime.strptime(str(v), "%d-%m-%Y %H:%M:%S")
     except Exception:
@@ -63,13 +71,13 @@ def parse_ts(v):
         except Exception:
             return None
 
-# ==============================
+# =========================
 # FETCH ALL DATA
-# ==============================
+# =========================
 def fetch_node(path):
     data = db.reference(path).get() or {}
     rows = []
-    for _, v in data.items():
+    for v in data.values():
         if not isinstance(v, dict):
             continue
         ts = parse_ts(v.get(TIME_FIELD))
@@ -78,74 +86,69 @@ def fetch_node(path):
             rows.append(v)
     return pd.DataFrame(rows)
 
-# ==============================
+# =========================
 # WINDOW AGGREGATION (SAFE)
-# ==============================
+# =========================
 def aggregate_window(df):
-    stats = {}
+    out = {}
     for c in FEATURE_FIELDS:
         if c in df.columns:
-            stats[c] = float(pd.to_numeric(df[c], errors="coerce").mean())
+            s = pd.to_numeric(df[c], errors="coerce")
+            out[c] = float(s.mean()) if not s.isna().all() else 0.0
         else:
-            stats[c] = 0.0
-    stats["n_readings"] = len(df)
-    return stats
+            out[c] = 0.0
+    out["n_readings"] = int(len(df))
+    return out
 
-# ==============================
-# WQI
-# ==============================
+# =========================
+# WQI (SIMPLE FORM)
+# =========================
 def compute_wqi(stats):
     weights = {
         "pH": 0.2, "dissolvedO2": 0.2, "turbidity": 0.2,
         "tds": 0.2, "temp": 0.1, "chlorophyll": 0.1
     }
-    score = 0.0
+    wqi = 0.0
     for k, w in weights.items():
         v = stats.get(k, 0.0)
-        if np.isnan(v):
-            v = 0.0
-        score += w * min(100, max(0, v * 10))
-    return round(score, 2)
+        v = 0.0 if np.isnan(v) else v
+        wqi += w * min(100.0, max(0.0, v * 10.0))
+    return round(wqi, 2)
 
-# ==============================
-# ML MODEL (FIXED)
-# ==============================
+# =========================
+# ML MODEL (HMM + XGB)
+# =========================
 class MLModel:
     def __init__(self, art_dir):
-        self.scaler = joblib_load(os.path.join(art_dir, "scaler.joblib"))
-        self.hmm = joblib_load(os.path.join(art_dir, "hmm_model.joblib"))
-        self.xgb = joblib_load(os.path.join(art_dir, "xgb_model.joblib"))
-        self.le = joblib_load(os.path.join(art_dir, "label_encoder.joblib"))
-        with open(os.path.join(art_dir, "final_feature_order.json")) as f:
+        self.scaler = joblib_load(f"{art_dir}/scaler.joblib")
+        self.hmm = joblib_load(f"{art_dir}/hmm_model.joblib")
+        self.xgb = joblib_load(f"{art_dir}/xgb_model.joblib")
+        self.le = joblib_load(f"{art_dir}/label_encoder.joblib")
+        with open(f"{art_dir}/final_feature_order.json") as f:
             self.features = json.load(f)
         print("✅ ML artifacts loaded")
 
-    def predict(self, stats_df):
-        # Feature vector
+    def predict(self, stats):
         X = []
         for c in self.features:
-            X.append(pd.to_numeric(stats_df.get(c, 0), errors="coerce").fillna(0).values)
-        X = np.column_stack(X)
+            X.append([float(stats.get(c, 0.0))])
+        X = np.array(X).T
 
-        # Scale
         Xs = self.scaler.transform(X)
 
-        # HMM features
         logprob, post = self.hmm.score_samples(Xs)
-        logfeat = np.full((len(Xs), 1), logprob / max(1, len(Xs)))
+        logfeat = np.array([[logprob]])
 
         Xh = np.hstack([Xs, post, logfeat])
 
-        # 🔥 FIX: use probabilities → argmax
-        proba = self.xgb.predict_proba(Xh)
-        y_idx = np.argmax(proba, axis=1)
-        conf = proba.max(axis=1)
+        y = self.xgb.predict(Xh)
+        prob = self.xgb.predict_proba(Xh).max(axis=1)
 
-        return self.le.inverse_transform(y_idx), conf
+        return self.le.inverse_transform(y)[0], float(prob[0])
 
-# ==============================
+# =========================
 # MAIN
-# ==============================
+# =========================
 def main():
     init_firebase()
 
@@ -158,30 +161,35 @@ def main():
         print("⚠️ No data found")
         return
 
+    df = df.rename(columns=COLUMN_ALIASES)
     df = df.sort_values("ts").reset_index(drop=True)
 
     model = MLModel(ART_DIR)
     ref = db.reference(PATH_OUT)
 
+    pushed = 0
     for i in range(0, len(df) - WINDOW_SIZE + 1, STEP_SIZE):
         win = df.iloc[i:i + WINDOW_SIZE]
         stats = aggregate_window(win)
 
-        cls, conf = model.predict(pd.DataFrame([stats]))
+        wqi = compute_wqi(stats)
+        cls, conf = model.predict(stats)
 
         payload = {
             **stats,
-            "wqi": compute_wqi(stats),
+            "wqi": wqi,
+            "model_class": cls,
+            "model_conf": conf,
             "window_start_iso": win["ts"].iloc[0].isoformat(),
             "window_end_iso": win["ts"].iloc[-1].isoformat(),
-            "model_class": cls[0],
-            "model_conf": float(conf[0]),
             "created_at": datetime.utcnow().isoformat()
         }
 
         ref.push(payload)
+        pushed += 1
 
-    print("✅ ALL WQI windows pushed successfully")
+    print(f"✅ {pushed} WQI windows pushed")
 
+# =========================
 if __name__ == "__main__":
     main()
