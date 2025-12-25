@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 firebase_window_wqi_service.py
-FINAL – LABELENCODER + XGB SAFE
+FINAL – ML SAFE + LOCATION SAFE
 """
 
 import os
@@ -51,7 +51,9 @@ COLUMN_ALIASES = {
 def init_firebase():
     if not firebase_admin._apps:
         cred = credentials.Certificate(SERVICE_ACCOUNT_JSON)
-        firebase_admin.initialize_app(cred, {"databaseURL": FIREBASE_DB_URL})
+        firebase_admin.initialize_app(
+            cred, {"databaseURL": FIREBASE_DB_URL}
+        )
     print("✅ Firebase connected")
 
 # =========================
@@ -72,13 +74,16 @@ def parse_ts(v):
 def fetch_node(path):
     data = db.reference(path).get() or {}
     rows = []
+
     for v in data.values():
         if not isinstance(v, dict):
             continue
+
         ts = parse_ts(v.get(TIME_FIELD))
         if ts:
             v["ts"] = ts
             rows.append(v)
+
     return pd.DataFrame(rows)
 
 # =========================
@@ -86,12 +91,31 @@ def fetch_node(path):
 # =========================
 def aggregate_window(df):
     out = {}
+
+    # numeric features
     for c in FEATURE_FIELDS:
         if c in df.columns:
             s = pd.to_numeric(df[c], errors="coerce")
             out[c] = float(s.mean()) if not s.isna().all() else 0.0
         else:
             out[c] = 0.0
+
+    # -------------------------
+    # LOCATION (CRITICAL FIX)
+    # -------------------------
+    if "lat" in df.columns and "lon" in df.columns:
+        lat = pd.to_numeric(df["lat"], errors="coerce")
+        lon = pd.to_numeric(df["lon"], errors="coerce")
+
+        lat = lat[(lat != 0) & (~lat.isna())]
+        lon = lon[(lon != 0) & (~lon.isna())]
+
+        out["lat"] = float(lat.mean()) if len(lat) else None
+        out["lon"] = float(lon.mean()) if len(lon) else None
+    else:
+        out["lat"] = None
+        out["lon"] = None
+
     out["n_readings"] = len(df)
     return out
 
@@ -100,18 +124,24 @@ def aggregate_window(df):
 # =========================
 def compute_wqi(stats):
     weights = {
-        "pH": 0.2, "dissolvedO2": 0.2, "turbidity": 0.2,
-        "tds": 0.2, "temp": 0.1, "chlorophyll": 0.1
+        "pH": 0.2,
+        "dissolvedO2": 0.2,
+        "turbidity": 0.2,
+        "tds": 0.2,
+        "temp": 0.1,
+        "chlorophyll": 0.1
     }
+
     wqi = 0.0
     for k, w in weights.items():
         v = stats.get(k, 0.0)
         v = 0.0 if np.isnan(v) else v
         wqi += w * min(100, max(0, v * 10))
+
     return round(wqi, 2)
 
 # =========================
-# ML MODEL (FIXED)
+# ML MODEL
 # =========================
 class MLModel:
     def __init__(self, art_dir):
@@ -119,8 +149,10 @@ class MLModel:
         self.hmm = joblib_load(f"{art_dir}/hmm_model.joblib")
         self.xgb = joblib_load(f"{art_dir}/xgb_model.joblib")
         self.le = joblib_load(f"{art_dir}/label_encoder.joblib")
+
         with open(f"{art_dir}/final_feature_order.json") as f:
             self.features = json.load(f)
+
         print("✅ ML artifacts loaded")
 
     def predict(self, stats):
@@ -132,15 +164,13 @@ class MLModel:
 
         Xh = np.hstack([Xs, post, logfeat])
 
-        # 🔥 FIX: enforce 1D class index
         y_raw = self.xgb.predict(Xh)
-
         if y_raw.ndim > 1:
             y_raw = np.argmax(y_raw, axis=1)
 
         conf = self.xgb.predict_proba(Xh).max(axis=1)
-
         cls = self.le.inverse_transform(y_raw.astype(int))[0]
+
         return cls, float(conf[0])
 
 # =========================
@@ -169,6 +199,10 @@ def main():
     for i in range(0, len(df) - WINDOW_SIZE + 1, STEP_SIZE):
         win = df.iloc[i:i + WINDOW_SIZE]
         stats = aggregate_window(win)
+
+        # 🚫 skip windows without valid location
+        if stats["lat"] is None or stats["lon"] is None:
+            continue
 
         wqi = compute_wqi(stats)
         cls, conf = model.predict(stats)
