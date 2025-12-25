@@ -79,7 +79,12 @@ def fetch_node(path):
         if not isinstance(v, dict):
             continue
 
-        ts = parse_ts(v.get(TIME_FIELD))
+        ts = (
+            parse_ts(v.get("timestamp")) or
+            parse_ts(v.get("time")) or
+            parse_ts(v.get("created_at"))
+        )
+
         if ts:
             v["ts"] = ts
             rows.append(v)
