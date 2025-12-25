@@ -92,7 +92,7 @@ def fetch_node(path):
 def aggregate_window(df):
     out = {}
 
-    # numeric features
+    # ---- sensor features ----
     for c in FEATURE_FIELDS:
         if c in df.columns:
             s = pd.to_numeric(df[c], errors="coerce")
@@ -100,24 +100,23 @@ def aggregate_window(df):
         else:
             out[c] = 0.0
 
-    # -------------------------
-    # LOCATION (CRITICAL FIX)
-    # -------------------------
+    # ---- location aggregation ----
     if "lat" in df.columns and "lon" in df.columns:
-        lat = pd.to_numeric(df["lat"], errors="coerce")
-        lon = pd.to_numeric(df["lon"], errors="coerce")
+        lat_s = pd.to_numeric(df["lat"], errors="coerce")
+        lon_s = pd.to_numeric(df["lon"], errors="coerce")
 
-        lat = lat[(lat != 0) & (~lat.isna())]
-        lon = lon[(lon != 0) & (~lon.isna())]
+        lat_s = lat_s[(lat_s != 0) & lat_s.notna()]
+        lon_s = lon_s[(lon_s != 0) & lon_s.notna()]
 
-        out["lat"] = float(lat.mean()) if len(lat) else None
-        out["lon"] = float(lon.mean()) if len(lon) else None
+        out["lat"] = float(lat_s.mean()) if len(lat_s) > 0 else None
+        out["lon"] = float(lon_s.mean()) if len(lon_s) > 0 else None
     else:
         out["lat"] = None
         out["lon"] = None
 
     out["n_readings"] = len(df)
     return out
+
 
 # =========================
 # WQI
